@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import io
 import json
 import numbers
 import pathlib
@@ -243,8 +244,20 @@ class CirqEncoder(json.JSONEncoder):
 
      - Python complex numbers get saved as a dictionary keyed by 'real'
        and 'imag'.
-     - Numpy ndarrays are converted to lists to use the json module's
-       built-in support for lists.
+     - The serialization of Numpy arrays falls into three cases.
+         1. The array contains Python objects (dtype.hasobject is True for the
+            array's dtype). In this case the array is converted to a list and
+            saved using the json module's built-in support for lists.
+       If dtype.hasobject is False for the numpy array's dtype, then there are
+       two cases:
+         2. The array contains only zeros and ones. In this case the array
+            elements are packed into a hex string. The hex string is saved in a
+            dictionary that also contains the original dtype of the array and
+            its shape.
+         3. All other cases. The array is converted to the NPY format and saved
+            as a hex string. See
+            https://docs.scipy.org/doc/numpy/reference/generated/numpy.lib.format.html
+            for a description of the NPY format.
      - Preliminary support for Sympy objects. Currently only sympy.Symbol.
        See https://github.com/quantumlib/Cirq/issues/2014
     """
@@ -265,7 +278,10 @@ class CirqEncoder(json.JSONEncoder):
                 'imag': o.imag,
             }
         if isinstance(o, np.ndarray):
-            return o.tolist()
+            return {
+                'cirq_type': 'np.ndarray',
+                'data': _numpy_array_to_json_serializable_object(o),
+            }
 
         # TODO: More support for sympy
         #       https://github.com/quantumlib/Cirq/issues/2014
@@ -313,6 +329,32 @@ class CirqEncoder(json.JSONEncoder):
             }
 
         return super().default(o)  # coverage: ignore
+
+
+def _numpy_array_to_json_serializable_object(a: np.ndarray) -> Union[List, Dict, str]:
+    if a.dtype.hasobject:
+        # Array contains arbitrary Python objects.
+        return a.tolist()
+    if np.array_equal(a, a.astype(np.bool)):
+        # Array is binary. Pack bits to save space.
+        return _numpy_bits_to_json_dict(a)
+    # Array can be saved using NPY format
+    return _numpy_array_to_npy_hex_string(a)
+
+
+def _numpy_bits_to_json_dict(a: np.ndarray) -> Dict:
+    return {'packed_bits': np.packbits(a).tobytes().hex(),
+            'dtype': a.dtype.name,
+            'shape': a.shape}
+
+
+def _numpy_array_to_npy_hex_string(a: np.ndarray) -> str:
+    buffer = io.BytesIO()
+    np.save(buffer, a, allow_pickle=False)
+    buffer.seek(0)
+    npy_hex = buffer.read().hex()
+    buffer.close()
+    return npy_hex
 
 
 def _cirq_object_hook(d, resolvers: List[Callable[[str], Union[None, Type]]]):
