@@ -1,4 +1,5 @@
-from typing import Dict, Iterable, List, NamedTuple, TYPE_CHECKING, Tuple
+from typing import (Dict, Iterable, List, NamedTuple, Optional, TYPE_CHECKING,
+                    Tuple)
 
 import collections
 import datetime
@@ -7,7 +8,7 @@ import os
 
 import numpy as np
 
-from cirq import circuits, devices, ops, sim, value
+from cirq import circuits, devices, ops, protocols, sim, value
 from cirq.experiments.cross_entropy_benchmarking import (CrossEntropyResult,
                                                          CrossEntropyPair)
 from cirq.experiments.random_quantum_circuit_generation import (
@@ -17,7 +18,7 @@ from cirq.experiments.random_quantum_circuit_generation import (
 if TYPE_CHECKING:
     import cirq
 
-BASE_DIR = os.path.expanduser(
+DEFAULT_BASE_DIR = os.path.expanduser(
     os.path.join('~', 'cirq-results', 'grid-parallel-xeb'))
 
 LAYER_A = GridInteractionLayer(col_offset=0, vertical=True, stagger=True)
@@ -50,11 +51,11 @@ def collect_parallel_two_qubit_xeb_on_grid_data(
         repetitions: int = 100_000,
         cycles: Iterable[int] = range(2, 103, 10),
         seed: 'cirq.value.RANDOM_STATE_LIKE' = None,
-        data_collection_id: Optional[str] = None) -> None:
+        data_collection_id: Optional[str] = None,
+        base_dir: str = DEFAULT_BASE_DIR) -> str:
     if data_collection_id is None:
         data_collection_id = datetime.datetime.now().isoformat()
     qubits = list(qubits)
-    coupled_qubit_pairs = _coupled_qubit_pairs(qubits)
     prng = value.parse_random_state(seed)
     max_cycles = max(cycles)
 
@@ -89,72 +90,61 @@ def collect_parallel_two_qubit_xeb_on_grid_data(
                                         data=circuits_and_trial_results)
             data[layer].append(xeb_data)
 
-    fn = os.path.join(BASE_DIR, data_collection_id, 'raw_data.json')
+    fn = os.path.join(base_dir, data_collection_id, 'raw_data.json')
     os.makedirs(os.path.dirname(fn), exist_ok=True)
-    cirq.to_json(list(data.items()), fn)
+    protocols.to_json(
+        {
+            'qubits': qubits,
+            'repetitions': repetitions,
+            'data': list(data.items())
+        }, fn)
+
+    return data_collection_id
 
 
-def estimate_parallel_two_qubit_xeb_fidelity_on_grid(
-        sampler: 'cirq.Sampler',
-        qubits: Iterable['cirq.GridQubit'],
-        two_qubit_gate: 'cirq.Gate',
-        *,
-        num_circuits: int = 20,
-        repetitions: int = 100_000,
-        cycles: Iterable[int] = range(2, 103, 10),
-        seed: 'cirq.value.RANDOM_STATE_LIKE' = None
+def compute_parallel_two_qubit_xeb_on_grid_fidelities(
+        data_collection_id: str, base_dir: str = DEFAULT_BASE_DIR
 ) -> Dict[Tuple['cirq.GridQubit', 'cirq.GridQubit'], CrossEntropyResult]:
-
-    qubits = list(qubits)
+    data_fn = os.path.join(base_dir, data_collection_id, 'raw_data.json')
+    data = protocols.read_json(data_fn)
+    qubits = data['qubits']
+    repetitions = data['repetitions']
+    xeb_data_lists = data['data']
     coupled_qubit_pairs = _coupled_qubit_pairs(qubits)
-    prng = value.parse_random_state(seed)
-    max_cycles = max(cycles)
-    xeb_results = {}
+    xeb_results = {
+    }  # type: Dict[Tuple[cirq.GridQubit, cirq.GridQubit], CrossEntropyResult]
 
-    for layer in (LAYER_A, LAYER_B, LAYER_C, LAYER_D):
+    for layer, xeb_data_list in xeb_data_lists:
         print(f'layer {layer}')
         print()
-        circuits_ = [
-            random_rotations_between_grid_interaction_layers_circuit(
-                qubits=qubits,
-                depth=max_cycles,
-                two_qubit_op_factory=lambda a, b, _: two_qubit_gate(a, b),
-                pattern=[layer],
-                single_qubit_gates=SINGLE_QUBIT_GATES,
-                add_final_single_qubit_layer=False,
-                seed=prng) for _ in range(num_circuits)
-        ]
         active_qubit_pairs = [
             pair for pair in coupled_qubit_pairs if pair in layer
         ]
-        xeb_pairs = collections.defaultdict(list)
-        for depth in cycles:
-            print(f'depth {depth}')
-            truncated_circuits = [circuit[:2 * depth] for circuit in circuits_]
-            trial_results = []
-            for truncated_circuit in truncated_circuits:
-                truncated_circuit.append(ops.measure(*qubits, key='m'))
-                trial_result = sampler.run(truncated_circuit,
-                                           repetitions=repetitions)
-                trial_results.append(trial_result)
+        xeb_pairs = collections.defaultdict(list) \
+    # type: Dict[Tuple[cirq.GridQubit, cirq.GridQubit], List[CrossEntropyPair]]
+
+        for depth, circuits_and_trial_results in xeb_data_list:
             for qubit_pair in active_qubit_pairs:
                 print(f'pair {qubit_pair}')
                 print()
-                fidelity = _get_xeb_fidelity(qubit_pair, truncated_circuits,
-                                             trial_results)
+                fidelity = _get_xeb_fidelity(qubit_pair,
+                                             circuits_and_trial_results)
                 xeb_pairs[qubit_pair].append(CrossEntropyPair(depth, fidelity))
-        for qubit_pair, xeb_pair in xeb_pairs.items():
-            xeb_results[qubit_pair] = CrossEntropyResult(
-                data=xeb_pair, repetitions=repetitions)
+        for qubit_pair, xeb_pair_list in xeb_pairs.items():
+            xeb_results[qubit_pair] = CrossEntropyResult(  # type: ignore
+                data=xeb_pair_list, repetitions=repetitions)
+
+    fn = os.path.join(base_dir, data_collection_id, 'fidelities.json')
+    protocols.to_json(list(xeb_results.items()), fn)
 
     return xeb_results
 
 
-def _get_xeb_fidelity(qubit_pair, circuits_, trial_results) -> float:
+def _get_xeb_fidelity(qubit_pair, circuits_and_trial_results) -> float:
     a, b = qubit_pair
     numerator = 0
     denominator = 0
-    for circuit, trial_result in zip(circuits_, trial_results):
+    for circuit, trial_result in circuits_and_trial_results:
         measurement_qubits = circuit[-1].operations[0].qubits
         # Get the measurement indices of this qubit pair
         qubit_indices = [
