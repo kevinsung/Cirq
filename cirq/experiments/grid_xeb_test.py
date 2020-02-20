@@ -31,7 +31,7 @@ def test_estimate_parallel_two_qubit_xeb_fidelity_on_grid(tmpdir):
         fidelities = [xeb_pair.xeb_fidelity for xeb_pair in result.data]
         np.testing.assert_allclose(fidelities, 1.0, atol=0.1)
 
-    # With depolarizing probability p
+    # With depolarizing probability e
     cycles = [60, 80, 100]
     e = 0.01
     data_collection_id = collect_parallel_two_qubit_xeb_on_grid_data(
@@ -39,8 +39,8 @@ def test_estimate_parallel_two_qubit_xeb_fidelity_on_grid(tmpdir):
                                             seed=65009),
         qubits=qubits,
         two_qubit_gate=two_qubit_gate,
-        num_circuits=100,
-        repetitions=100_000,
+        num_circuits=50,
+        repetitions=10_000,
         cycles=cycles,
         seed=14947,
         base_dir=base_dir)

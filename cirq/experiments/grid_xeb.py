@@ -1,7 +1,8 @@
-from typing import (Dict, Iterable, List, NamedTuple, Optional, TYPE_CHECKING,
-                    Tuple)
+from typing import (Dict, Iterable, List, NamedTuple, Optional, Sequence,
+                    TYPE_CHECKING, Tuple)
 
 import collections
+import dataclasses
 import datetime
 import itertools
 import os
@@ -37,9 +38,18 @@ class CircuitAndTrialResult(NamedTuple):
     trial_result: 'cirq.TrialResult'
 
 
-class CrossEntropyData(NamedTuple):
-    num_cycle: int
-    data: List[CircuitAndTrialResult]
+@dataclasses.dataclass
+class ParallelXEBTrialResultParameters:
+    data_collection_id: str
+    layer: GridInteractionLayer
+    depth: int
+    circuit_index: int
+
+    @property
+    def fn(self) -> str:
+        return os.path.join(self.data_collection_id, 'data', f'{self.layer}',
+                            f'depth-{self.depth}',
+                            f'circuit-{self.circuit_index}.json')
 
 
 def collect_parallel_two_qubit_xeb_on_grid_data(
@@ -50,22 +60,37 @@ def collect_parallel_two_qubit_xeb_on_grid_data(
         num_circuits: int = 20,
         repetitions: int = 100_000,
         cycles: Iterable[int] = range(2, 103, 10),
+        layers: Sequence[GridInteractionLayer] = (LAYER_A, LAYER_B, LAYER_C,
+                                                  LAYER_D),
         seed: 'cirq.value.RANDOM_STATE_LIKE' = None,
         data_collection_id: Optional[str] = None,
         base_dir: str = DEFAULT_BASE_DIR) -> str:
+
     if data_collection_id is None:
         data_collection_id = datetime.datetime.now().isoformat()
     qubits = list(qubits)
+    cycles = list(cycles)
     prng = value.parse_random_state(seed)
+
+    # Save metadata
+    fn = os.path.join(base_dir, data_collection_id, 'metadata.json')
+    os.makedirs(os.path.dirname(fn), exist_ok=True)
+    protocols.to_json(
+        {
+            'qubits': qubits,
+            'two_qubit_gate': two_qubit_gate,
+            'num_circuits': num_circuits,
+            'repetitions': repetitions,
+            'cycles': cycles,
+            'layers': list(layers),
+            'seed': seed
+        }, fn)
+
+    # Generate all circuits
     max_cycles = max(cycles)
-
-    data = collections.defaultdict(
-        list)  # type: Dict[GridInteractionLayer, List[CrossEntropyData]]
-
-    for layer in (LAYER_A, LAYER_B, LAYER_C, LAYER_D):
-        print(f'layer {layer}')
-        print()
-        circuits_ = [
+    circuits_ = {}
+    for layer in layers:
+        circuits_[layer] = [
             random_rotations_between_grid_interaction_layers_circuit(
                 qubits=qubits,
                 depth=max_cycles,
@@ -75,29 +100,34 @@ def collect_parallel_two_qubit_xeb_on_grid_data(
                 add_final_single_qubit_layer=False,
                 seed=prng) for _ in range(num_circuits)
         ]
-        for depth in cycles:
-            print(f'depth {depth}')
-            truncated_circuits = [circuit[:2 * depth] for circuit in circuits_]
-            circuits_and_trial_results = []
-            for truncated_circuit in truncated_circuits:
+
+    # Loop over depth first, then layer
+    for depth in cycles:
+        print(f'Depth {depth}')
+        for layer in layers:
+            print(f'Layer {layer}')
+            truncated_circuits = [
+                circuit[:2 * depth] for circuit in circuits_[layer]
+            ]
+            for i, truncated_circuit in enumerate(truncated_circuits):
+                params = ParallelXEBTrialResultParameters(
+                    data_collection_id=data_collection_id,
+                    layer=layer,
+                    depth=depth,
+                    circuit_index=i)
+                fn = os.path.join(base_dir, params.fn)
+                if os.path.exists(fn):
+                    print(f'{fn} exists, skipping.')
+                    continue
                 truncated_circuit.append(ops.measure(*qubits, key='m'))
                 trial_result = sampler.run(truncated_circuit,
                                            repetitions=repetitions)
-                circuit_and_trial_result = CircuitAndTrialResult(
-                    circuit=truncated_circuit, trial_result=trial_result)
-                circuits_and_trial_results.append(circuit_and_trial_result)
-            xeb_data = CrossEntropyData(num_cycle=depth,
-                                        data=circuits_and_trial_results)
-            data[layer].append(xeb_data)
-
-    fn = os.path.join(base_dir, data_collection_id, 'raw_data.json')
-    os.makedirs(os.path.dirname(fn), exist_ok=True)
-    protocols.to_json(
-        {
-            'qubits': qubits,
-            'repetitions': repetitions,
-            'data': list(data.items())
-        }, fn)
+                os.makedirs(os.path.dirname(fn), exist_ok=True)
+                protocols.to_json(
+                    {
+                        'circuit': truncated_circuit,
+                        'trial_result': trial_result
+                    }, fn)
 
     return data_collection_id
 
@@ -105,28 +135,43 @@ def collect_parallel_two_qubit_xeb_on_grid_data(
 def compute_parallel_two_qubit_xeb_on_grid_fidelities(
         data_collection_id: str, base_dir: str = DEFAULT_BASE_DIR
 ) -> Dict[Tuple['cirq.GridQubit', 'cirq.GridQubit'], CrossEntropyResult]:
-    data_fn = os.path.join(base_dir, data_collection_id, 'raw_data.json')
-    data = protocols.read_json(data_fn)
-    qubits = data['qubits']
-    repetitions = data['repetitions']
-    xeb_data_lists = data['data']
+
+    fn = os.path.join(base_dir, data_collection_id, 'metadata.json')
+    metadata = protocols.read_json(fn)
+    qubits = metadata['qubits']
+    num_circuits = metadata['num_circuits']
+    repetitions = metadata['repetitions']
+    cycles = metadata['cycles']
+    layers = metadata['layers']
+
     coupled_qubit_pairs = _coupled_qubit_pairs(qubits)
     xeb_results = {
     }  # type: Dict[Tuple[cirq.GridQubit, cirq.GridQubit], CrossEntropyResult]
 
-    for layer, xeb_data_list in xeb_data_lists:
-        print(f'layer {layer}')
-        print()
+    for layer in layers:
+        print(f'Layer {layer}')
         active_qubit_pairs = [
             pair for pair in coupled_qubit_pairs if pair in layer
         ]
         xeb_pairs = collections.defaultdict(list) \
     # type: Dict[Tuple[cirq.GridQubit, cirq.GridQubit], List[CrossEntropyPair]]
 
-        for depth, circuits_and_trial_results in xeb_data_list:
+        for depth in cycles:
+            print(f'Depth {depth}')
+            circuits_and_trial_results = []  # type: List[CircuitAndTrialResult]
+            for i in range(num_circuits):
+                params = ParallelXEBTrialResultParameters(
+                    data_collection_id=data_collection_id,
+                    layer=layer,
+                    depth=depth,
+                    circuit_index=i)
+                fn = os.path.join(base_dir, params.fn)
+                data = protocols.read_json(fn)
+                circuit_and_trial_result = CircuitAndTrialResult(
+                    circuit=data['circuit'], trial_result=data['trial_result'])
+                circuits_and_trial_results.append(circuit_and_trial_result)
             for qubit_pair in active_qubit_pairs:
-                print(f'pair {qubit_pair}')
-                print()
+                print(f'Pair {qubit_pair}')
                 fidelity = _get_xeb_fidelity(qubit_pair,
                                              circuits_and_trial_results)
                 xeb_pairs[qubit_pair].append(CrossEntropyPair(depth, fidelity))
@@ -142,8 +187,8 @@ def compute_parallel_two_qubit_xeb_on_grid_fidelities(
 
 def _get_xeb_fidelity(qubit_pair, circuits_and_trial_results) -> float:
     a, b = qubit_pair
-    numerator = 0
-    denominator = 0
+    numerator = 0.0
+    denominator = 0.0
     for circuit, trial_result in circuits_and_trial_results:
         measurement_qubits = circuit[-1].operations[0].qubits
         # Get the measurement indices of this qubit pair
