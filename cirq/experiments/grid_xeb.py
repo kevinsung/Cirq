@@ -39,6 +39,19 @@ class CircuitAndTrialResult(NamedTuple):
 
 
 @dataclasses.dataclass
+class ParallelXEBCircuitParameters:
+    data_collection_id: str
+    layer: GridInteractionLayer
+    circuit_index: int
+
+    @property
+    def fn(self) -> str:
+        return os.path.join(self.data_collection_id, 'circuits',
+                            f'{self.layer}',
+                            f'circuit-{self.circuit_index}.json')
+
+
+@dataclasses.dataclass
 class ParallelXEBTrialResultParameters:
     data_collection_id: str
     layer: GridInteractionLayer
@@ -86,22 +99,30 @@ def collect_parallel_two_qubit_xeb_on_grid_data(
             'seed': seed
         }, fn)
 
-    # Generate all circuits
+    # Generate and save all circuits
     max_cycles = max(cycles)
-    circuits_ = {}
+    circuits_ = collections.defaultdict(
+            list)  # type: Dict[GridInteractionLayer, List[cirq.Circuit]]
     for layer in layers:
-        circuits_[layer] = [
-            random_rotations_between_grid_interaction_layers_circuit(
+        for i in range(num_circuits):
+            circuit = random_rotations_between_grid_interaction_layers_circuit(
                 qubits=qubits,
                 depth=max_cycles,
                 two_qubit_op_factory=lambda a, b, _: two_qubit_gate(a, b),
                 pattern=[layer],
                 single_qubit_gates=SINGLE_QUBIT_GATES,
                 add_final_single_qubit_layer=False,
-                seed=prng) for _ in range(num_circuits)
-        ]
+                seed=prng)
+            circuits_[layer].append(circuit)
+            params = ParallelXEBCircuitParameters(
+                    data_collection_id=data_collection_id,
+                    layer=layer,
+                    circuit_index=i)
+            fn = os.path.join(base_dir, params.fn)
+            os.makedirs(os.path.dirname(fn), exist_ok=True)
+            protocols.to_json(circuit, fn)
 
-    # Loop over depth first, then layer
+    # Collect data
     for depth in cycles:
         print(f'Depth {depth}')
         for layer in layers:
@@ -110,18 +131,15 @@ def collect_parallel_two_qubit_xeb_on_grid_data(
                 circuit[:2 * depth] for circuit in circuits_[layer]
             ]
             for i, truncated_circuit in enumerate(truncated_circuits):
+                truncated_circuit.append(ops.measure(*qubits, key='m'))
+                trial_result = sampler.run(truncated_circuit,
+                                           repetitions=repetitions)
                 params = ParallelXEBTrialResultParameters(
                     data_collection_id=data_collection_id,
                     layer=layer,
                     depth=depth,
                     circuit_index=i)
                 fn = os.path.join(base_dir, params.fn)
-                if os.path.exists(fn):
-                    print(f'{fn} exists, skipping.')
-                    continue
-                truncated_circuit.append(ops.measure(*qubits, key='m'))
-                trial_result = sampler.run(truncated_circuit,
-                                           repetitions=repetitions)
                 os.makedirs(os.path.dirname(fn), exist_ok=True)
                 protocols.to_json(
                     {
